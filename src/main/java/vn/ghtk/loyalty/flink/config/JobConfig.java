@@ -11,6 +11,7 @@ public class JobConfig {
     private final String kafkaBootstrapServers;
     private final String kafkaTopic;
     private final String kafkaGroupId;
+    private final String outputTopic;
     
     // MySQL configuration
     private final String mysqlUrl;
@@ -28,8 +29,9 @@ public class JobConfig {
     public JobConfig(ParameterTool params) {
         // Kafka
         this.kafkaBootstrapServers = params.get("kafka.bootstrap.servers", "localhost:9092");
-        this.kafkaTopic = params.get("kafka.topic", "loyalty.checkin");
-        this.kafkaGroupId = params.get("kafka.group.id", "loyalty-consumer-group");
+        this.kafkaTopic = params.get("kafka.topic", "loyalty.checkin.raw");
+        this.kafkaGroupId = params.get("kafka.group.id", "loyalty-flink-consumer");
+        this.outputTopic = params.get("kafka.output.topic", "loyalty.point.transaction");
         
         // MySQL
         this.mysqlUrl = params.get("mysql.url", "jdbc:mysql://localhost:3306/loyalty_db");
@@ -66,6 +68,10 @@ public class JobConfig {
 
     public String getKafkaGroupId() {
         return kafkaGroupId;
+    }
+
+    public String getOutputTopic() {
+        return outputTopic;
     }
 
     public String getMysqlUrl() {

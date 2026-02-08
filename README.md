@@ -1,39 +1,62 @@
 # Loyalty Flink Consumer
 
+> **Part of Loyalty System:** Đây là Apache Flink streaming job (Stream Processor) trong hệ thống 3-tier architecture.
+> - **loyalty-infra** - Infrastructure (xem [../loyalty-infra](../loyalty-infra))
+> - **loyalty-service** - Spring Boot app (xem [../loyalty-service](../loyalty-service))
+> - **loyalty-flink-consumer** - Job này
+
 Apache Flink consumer job cho xử lý loyalty check-in events từ Kafka với exactly-once semantics.
 
 ## 🚀 Tech Stack
 
-- **Java 21**
+- **Java 17** (target, để chạy trên Flink 1.18.1 Java 17 containers)
 - **Apache Flink 1.18.1**
-- **Kafka** - Source (loyalty.checkin topic)
-- **MySQL 8.0** - Sink (exactly-once with 2PC)
+- **Kafka** - Source (`loyalty.checkin.raw`) và Sink (`loyalty.point.transaction`)
+- **MySQL 8.0** - Query để dedup và calculate (không ghi trực tiếp)
 - **Jackson** - JSON serialization/deserialization
 
 ## 📋 Tính năng
 
-1. **Kafka Source**
-   - Consumer từ topic `loyalty.checkin`
-   - Exactly-once semantics
-   - Deduplication theo `eventId`
+### Architecture: Kafka → Flink → Kafka
 
-2. **Stream Processing**
-   - Validate business rules
-   - Calculate points based on monthly check-in order
-   - Dedup với MapState (keyed by eventId)
+```
+loyalty.checkin.raw (Kafka)
+         ↓
+    Flink Job
+  - Consume events
+  - Dedup (state + DB check)
+  - Apply business rule (points)
+  - Calculate checkin order
+         ↓
+loyalty.point.transaction (Kafka)
+         ↓
+  loyalty-service (DB Writer)
+         ↓
+      MySQL
+```
 
-3. **MySQL Sink**
-   - 2-Phase Commit (2PC) for exactly-once
-   - Atomic writes to 3 tables:
-     - `users` - cập nhật total_points
-     - `daily_checkin` - log check-in record
-     - `user_points_history` - log points transaction
-     - `checkin_events` - log event for dedup and monitoring
+### 1. Kafka Source
+- Consumer từ topic `loyalty.checkin.raw`
+- Exactly-once semantics với isolation level `read_committed`
+- Deduplication theo `eventId` (MapState + DB check)
 
-4. **Checkpoint & State**
-   - Checkpoint interval: 60 seconds
-   - State backend: RocksDB (for large state)
-   - Savepoint support for upgrades
+### 2. Stream Processing
+- **KeyBy userId** để process events per user
+- **Dedup layer**: MapState (TTL 7 days) + DB check
+- **Business logic**: Calculate checkin order, apply points rule
+- **Output**: `PointTransactionEvent` với transactionId unique
+
+### 3. Kafka Sink (Transactional)
+- Publish `PointTransactionEvent` lên topic `loyalty.point.transaction`
+- Kafka transactional producer (`DeliveryGuarantee.EXACTLY_ONCE`)
+- Transactional ID prefix: `flink-loyalty-tx-`
+- **Key by userId**: Ensures same user events → same partition → prevents deadlock in DB Writer
+
+### 4. Checkpoint & State
+- Checkpoint interval: 60 seconds
+- State backend: Hashmap (in-memory, rollback version - không dùng RocksDB)
+- Checkpoint storage: Local filesystem (`file:///tmp/flink-checkpoints`)
+- Savepoint support for upgrades
 
 ## 🏗️ Cấu trúc
 
@@ -44,16 +67,17 @@ loyalty-flink-consumer/
 ├── src/
 │   └── main/
 │       ├── java/vn/ghtk/loyalty/flink/
-│       │   ├── CheckinEventConsumerJob.java        # Main job
+│       │   ├── CheckinEventConsumerJob.java              # Main job (Kafka → Kafka)
 │       │   ├── model/
-│       │   │   ├── CheckinEvent.java               # Event model
-│       │   │   └── EventMetadata.java              # Metadata model
+│       │   │   ├── CheckinEvent.java                     # Input event
+│       │   │   ├── PointTransactionEvent.java            # Output event
+│       │   │   └── EventMetadata.java                    # Metadata
 │       │   ├── function/
-│       │   │   ├── CheckinEventDeserializer.java   # Kafka deserializer
-│       │   │   ├── CheckinProcessFunction.java     # Process function with dedup
-│       │   │   └── MySQLCheckinSink.java           # JDBC sink with 2PC
+│       │   │   ├── CheckinEventDeserializer.java         # Kafka deserializer
+│       │   │   ├── PointTransactionProcessFunction.java  # Dedup + business logic
+│       │   │   └── PointTransactionSerializer.java       # Kafka serializer
 │       │   └── config/
-│       │       └── JobConfig.java                  # Job configuration
+│       │       └── JobConfig.java                        # Job configuration
 │       └── resources/
 │           └── log4j2.properties
 └── target/
@@ -62,38 +86,36 @@ loyalty-flink-consumer/
 
 ## 🛠️ Build
 
-```bash
-mvn clean package
+```powershell
+mvn clean package -DskipTests
 ```
 
 Output: `target/loyalty-flink-consumer-1.0.0-SNAPSHOT.jar`
 
-## 🚀 Run
+## 🚀 Deploy to Flink Cluster
 
-### Local Development
+### Prerequisites
+- Infrastructure đã chạy (xem [../loyalty-infra](../loyalty-infra))
+- Kafka topics đã được tạo
 
-```bash
-# Run từ IDE hoặc Maven
-mvn exec:java -Dexec.mainClass="vn.ghtk.loyalty.flink.CheckinEventConsumerJob"
+### 1. Copy JAR vào Flink JobManager
+
+```powershell
+docker cp target\loyalty-flink-consumer-1.0.0-SNAPSHOT.jar loyalty-flink-jobmanager:/opt/flink/
 ```
 
-### Flink Cluster
+### 2. Submit job (1 dòng)
 
-```bash
-# Submit job to Flink cluster
-flink run \
-  -c vn.ghtk.loyalty.flink.CheckinEventConsumerJob \
-  -p 4 \
-  target/loyalty-flink-consumer-1.0.0-SNAPSHOT.jar \
-  --kafka.bootstrap.servers localhost:9092 \
-  --kafka.topic loyalty.checkin \
-  --kafka.group.id loyalty-consumer-group \
-  --mysql.url jdbc:mysql://localhost:3306/loyalty_db \
-  --mysql.username root \
-  --mysql.password root \
-  --checkpoint.interval 60000 \
-  --parallelism 4
+```powershell
+docker exec -it loyalty-flink-jobmanager flink run -c vn.ghtk.loyalty.flink.CheckinEventConsumerJob -p 4 /opt/flink/loyalty-flink-consumer-1.0.0-SNAPSHOT.jar --kafka.bootstrap.servers kafka:29092 --kafka.topic loyalty.checkin.raw --kafka.group.id loyalty-flink-consumer --kafka.output.topic loyalty.point.transaction --mysql.url jdbc:mysql://mysql:3306/loyalty_db --mysql.username root --mysql.password root --checkpoint.interval 60000 --parallelism 4
 ```
+
+### 3. Verify job
+
+- **Flink UI**: http://localhost:8081
+- **Kafka UI**: http://localhost:8090
+  - Check topic `loyalty.checkin.raw` (input)
+  - Check topic `loyalty.point.transaction` (output)
 
 ## ⚙️ Configuration
 
@@ -102,9 +124,10 @@ Job arguments (all optional, có defaults):
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--kafka.bootstrap.servers` | `localhost:9092` | Kafka bootstrap servers |
-| `--kafka.topic` | `loyalty.checkin` | Kafka topic name |
-| `--kafka.group.id` | `loyalty-consumer-group` | Consumer group ID |
-| `--mysql.url` | `jdbc:mysql://localhost:3306/loyalty_db` | MySQL JDBC URL |
+| `--kafka.topic` | `loyalty.checkin.raw` | Input Kafka topic |
+| `--kafka.output.topic` | `loyalty.point.transaction` | Output Kafka topic |
+| `--kafka.group.id` | `loyalty-flink-consumer` | Consumer group ID |
+| `--mysql.url` | `jdbc:mysql://localhost:3306/loyalty_db` | MySQL JDBC URL (for query only) |
 | `--mysql.username` | `root` | MySQL username |
 | `--mysql.password` | `root` | MySQL password |
 | `--checkpoint.interval` | `60000` | Checkpoint interval (ms) |
@@ -136,28 +159,27 @@ Job arguments (all optional, có defaults):
 - **Memory per TaskManager**: 4 GB
 - **CPU per TaskManager**: 2 cores
 
-### Sizing cho 50 triệu event/ngày
-
-- **Kafka Partitions**: 16
-- **Flink Parallelism**: 16
-- **Checkpoint Interval**: 60 seconds
-- **State Size**: ~2.5 GB (50 triệu event IDs * 50 bytes)
-- **Memory per TaskManager**: 8 GB
-- **CPU per TaskManager**: 4 cores
-
 ## 🔒 Exactly-Once Guarantees
 
 1. **Kafka → Flink**: Flink Kafka connector với offset commit sau checkpoint
-2. **Flink State**: MapState cho deduplication theo eventId
-3. **Flink → MySQL**: JDBC sink với 2-Phase Commit (XA transactions)
-4. **Checkpoint**: RocksDB state backend với incremental checkpoint
+2. **Flink State**: MapState cho deduplication theo eventId (TTL 7 days)
+3. **Flink → Kafka**: Kafka transactional sink (`DeliveryGuarantee.EXACTLY_ONCE`)
+   - **Partitioning**: Messages keyed by `userId` → same user always in same partition
+4. **Kafka → loyalty-service**: Consumer manual commit + DB dedup theo transactionId
+   - **Concurrency**: 4 threads (match 4 partitions) → no deadlock vì same userId = same thread
+
+**End-to-end exactly-once**:
+- API → Kafka (idempotent producer)
+- Kafka → Flink (checkpoint + transactional sink)
+- Flink → Kafka (transactional)
+- Kafka → DB (manual commit + idempotent write)
 
 ## 📝 Notes
 
-- State TTL: 7 ngày (event IDs auto-expire sau 7 ngày)
-- Retry strategy: 3 retries với exponential backoff
-- Timeout: 30 seconds per transaction
-- Idempotency: Dựa trên unique constraint của `event_id` trong DB
+- **State TTL**: 7 ngày (event IDs auto-expire)
+- **Checkpoint storage**: Local (nếu muốn persist, dùng MinIO/S3)
+- **State backend**: Hashmap (in-memory). Nếu cần large state, đổi sang RocksDB.
+- **MySQL role**: Chỉ dùng để query checkin count, không ghi trực tiếp.
 
 ## 🐛 Troubleshooting
 
@@ -169,9 +191,37 @@ Job arguments (all optional, có defaults):
 - Tăng heap memory cho TaskManager
 - Enable RocksDB state backend cho large state
 
-### MySQL deadlock
-- Kiểm tra index trên `event_id`, `user_id`, `checkin_date`
-- Tăng MySQL timeout settings
+### Cannot deserialize event
+- Check event schema compatibility giữa producer và consumer
+- Verify Jackson config (LocalDateTime serialization)
+
+### Duplicate transactions in DB
+- Check DB Writer deduplication logic
+- Verify unique constraint trên `transactionId` hoặc `description`
+
+## 🔄 Operations
+
+### Cancel job
+```powershell
+docker exec -it loyalty-flink-jobmanager flink list
+docker exec -it loyalty-flink-jobmanager flink cancel <JOB_ID>
+```
+
+### Cancel with savepoint
+```powershell
+docker exec -it loyalty-flink-jobmanager flink cancel -s file:///tmp/flink-savepoints <JOB_ID>
+```
+
+### Resume from savepoint
+```powershell
+docker exec -it loyalty-flink-jobmanager flink run -s file:///tmp/flink-savepoints/<savepoint-dir> -c vn.ghtk.loyalty.flink.CheckinEventConsumerJob /opt/flink/loyalty-flink-consumer-1.0.0-SNAPSHOT.jar ...
+```
+
+## 📚 References
+
+- [Flink Kafka Connector](https://nightlies.apache.org/flink/flink-docs-release-1.18/docs/connectors/datastream/kafka/)
+- [Flink Checkpointing](https://nightlies.apache.org/flink/flink-docs-release-1.18/docs/dev/datastream/fault-tolerance/checkpointing/)
+- [Flink State & Fault Tolerance](https://nightlies.apache.org/flink/flink-docs-release-1.18/docs/concepts/stateful-stream-processing/)
 
 ## 📄 License
 
